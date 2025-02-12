@@ -31,11 +31,13 @@ struct blockwise_transfer
     size_t block_size;
     const char *path_prefix;
     const char *path;
+    char *stored_path;
     uint8_t *block_buffer;
     union
     {
         read_block_cb read_cb;
         write_block_cb write_cb;
+        golioth_set_cb_fn set_cb;
     } callback;
     enum golioth_status status;
     struct golioth_coap_rsp_code coap_rsp_code;
@@ -71,15 +73,17 @@ static void blockwise_upload_free(struct blockwise_transfer *ctx)
 
     golioth_sys_sem_destroy(ctx->sem);
     free(ctx->block_buffer);
+    free(ctx->stored_path);
 }
 
 // Function to initialize the blockwise_transfer structure for uploads
 struct blockwise_transfer *blockwise_upload_init(const char *path_prefix,
                                                  const char *path,
                                                  enum golioth_content_type content_type,
-                                                 size_t block_buffer_size)
+                                                 size_t block_buffer_size,
+                                                 bool store_path)
 {
-    if (strlen(path) > CONFIG_GOLIOTH_COAP_MAX_PATH_LEN)
+    if ((store_path) && (strlen(path) > CONFIG_GOLIOTH_COAP_MAX_PATH_LEN))
     {
         GLTH_LOGE(TAG, "Path too long: %zu > %zu", strlen(path), CONFIG_GOLIOTH_COAP_MAX_PATH_LEN);
         return NULL;
@@ -93,6 +97,7 @@ struct blockwise_transfer *blockwise_upload_init(const char *path_prefix,
 
     ctx->block_buffer = NULL;
     ctx->sem = NULL;
+    ctx->stored_path = NULL;
 
     if (block_buffer_size)
     {
@@ -101,6 +106,17 @@ struct blockwise_transfer *blockwise_upload_init(const char *path_prefix,
         {
             goto free_and_finish;
         }
+    }
+
+    if (store_path)
+    {
+        ctx->stored_path = golioth_sys_malloc(strlen(path) + 1);
+        if (!ctx->stored_path)
+        {
+            goto free_and_finish;
+        }
+
+        strncpy(ctx->stored_path, path, strlen(path) + 1);
     }
 
     ctx->sem = golioth_sys_sem_create(1, 0);
@@ -144,6 +160,22 @@ static void on_block_sent(struct golioth_client *client,
     ctx->negotiated_blocksize_szx = block_szx;
 
     golioth_sys_sem_give(ctx->sem);
+}
+
+// Blockwise multi-part upload's internal callback function that the COAP client calls
+static void on_multi_block_sent(struct golioth_client *client,
+                                enum golioth_status status,
+                                const struct golioth_coap_rsp_code *coap_rsp_code,
+                                const char *path,
+                                size_t block_szx,
+                                void *arg)
+{
+    struct blockwise_transfer *ctx = (struct blockwise_transfer *) arg;
+
+    if (ctx->callback.set_cb)
+    {
+        ctx->callback.set_cb(client, status, coap_rsp_code, path, ctx->callback_arg);
+    }
 }
 
 // Function to call the application's read block callback for obtaining
@@ -271,7 +303,8 @@ enum golioth_status golioth_blockwise_post(struct golioth_client *client,
         blockwise_upload_init(path_prefix,
                               path,
                               content_type,
-                              CONFIG_GOLIOTH_BLOCKWISE_UPLOAD_MAX_BLOCK_SIZE);
+                              CONFIG_GOLIOTH_BLOCKWISE_UPLOAD_MAX_BLOCK_SIZE,
+                              false);
     if (!ctx)
     {
         return GOLIOTH_ERR_MEM_ALLOC;
@@ -313,6 +346,61 @@ enum golioth_status golioth_blockwise_post(struct golioth_client *client,
     return status;
 }
 
+// Create an async upload context
+struct blockwise_transfer *golioth_blockwise_upload_start(const char *path_prefix,
+                                                          const char *path,
+                                                          enum golioth_content_type content_type,
+                                                          golioth_set_cb_fn cb,
+                                                          void *callback_arg)
+{
+    struct blockwise_transfer *ctx =
+        blockwise_upload_init(path_prefix, path, content_type, 0, true);
+    if (!ctx)
+    {
+        return NULL;
+    }
+
+    ctx->callback.set_cb = cb;
+    ctx->callback_arg = callback_arg;
+
+    return ctx;
+}
+
+// Destroy an async upload context
+void golioth_blockwise_upload_stop(struct blockwise_transfer *ctx)
+{
+    blockwise_upload_free(ctx);
+}
+
+// Send a single block asynchronously
+enum golioth_status golioth_blockwise_upload_block(struct golioth_client *client,
+                                                   struct blockwise_transfer *ctx,
+                                                   uint32_t block_idx,
+                                                   uint8_t *block_buffer,
+                                                   size_t data_len,
+                                                   bool is_last)
+{
+    if (!client || !ctx || !block_buffer)
+    {
+        return GOLIOTH_ERR_NULL;
+    }
+
+    return golioth_coap_client_set_block(
+        client,
+        ctx->token,
+        ctx->path_prefix,
+        ctx->stored_path,
+        is_last,
+        ctx->content_type,
+        block_idx,
+        BLOCKSIZE_TO_SZX(CONFIG_GOLIOTH_BLOCKWISE_DOWNLOAD_MAX_BLOCK_SIZE),
+        block_buffer,
+        data_len,
+        on_multi_block_sent,
+        ctx,
+        false,
+        GOLIOTH_SYS_WAIT_FOREVER);
+}
 
 /* Blockwise Downloads related functions */
 

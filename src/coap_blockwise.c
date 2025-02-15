@@ -6,9 +6,12 @@
 
 #include <golioth/client.h>
 #include <string.h>
+#include <golioth/golioth_debug.h>
 #include <assert.h>
 #include "coap_client.h"
 #include "coap_blockwise.h"
+
+LOG_TAG_DEFINE(coap_blockwise);
 
 _Static_assert(BLOCKSIZE_TO_SZX(CONFIG_GOLIOTH_BLOCKWISE_DOWNLOAD_MAX_BLOCK_SIZE) != -1,
                "GOLIOTH_BLOCKWISE_DOWNLOAD_MAX_BLOCK_SIZE must be "
@@ -28,11 +31,13 @@ struct blockwise_transfer
     size_t block_size;
     const char *path_prefix;
     const char *path;
+    char *stored_path;
     uint8_t *block_buffer;
     union
     {
         read_block_cb read_cb;
         write_block_cb write_cb;
+        golioth_set_cb_fn set_cb;
     } callback;
     enum golioth_status status;
     struct golioth_coap_rsp_code coap_rsp_code;
@@ -59,25 +64,84 @@ struct get_block_ctx
 
 /* Blockwise Uploads related functions */
 
-// Function to initialize the blockwise_transfer structure for uploads
-static void blockwise_upload_init(struct blockwise_transfer *ctx,
-                                  uint8_t *data_buf,
-                                  const char *path_prefix,
-                                  const char *path,
-                                  enum golioth_content_type content_type,
-                                  read_block_cb cb,
-                                  void *callback_arg)
+static void blockwise_upload_free(struct blockwise_transfer *ctx)
 {
+    if (!ctx)
+    {
+        return;
+    }
+
+    golioth_sys_sem_destroy(ctx->sem);
+    free(ctx->block_buffer);
+    free(ctx->stored_path);
+}
+
+// Function to initialize the blockwise_transfer structure for uploads
+struct blockwise_transfer *blockwise_upload_init(const char *path_prefix,
+                                                 const char *path,
+                                                 enum golioth_content_type content_type,
+                                                 size_t block_buffer_size,
+                                                 bool store_path)
+{
+    if ((store_path) && (strlen(path) > CONFIG_GOLIOTH_COAP_MAX_PATH_LEN))
+    {
+        GLTH_LOGE(TAG, "Path too long: %zu > %zu", strlen(path), CONFIG_GOLIOTH_COAP_MAX_PATH_LEN);
+        return NULL;
+    }
+
+    struct blockwise_transfer *ctx = golioth_sys_malloc(sizeof(struct blockwise_transfer));
+    if (!ctx)
+    {
+        goto finish;
+    }
+
+    ctx->block_buffer = NULL;
+    ctx->sem = NULL;
+    ctx->stored_path = NULL;
+
+    if (block_buffer_size)
+    {
+        ctx->block_buffer = golioth_sys_malloc(block_buffer_size);
+        if (!ctx->block_buffer)
+        {
+            goto free_and_finish;
+        }
+    }
+
+    if (store_path)
+    {
+        ctx->stored_path = golioth_sys_malloc(strlen(path) + 1);
+        if (!ctx->stored_path)
+        {
+            goto free_and_finish;
+        }
+
+        strncpy(ctx->stored_path, path, strlen(path) + 1);
+    }
+
+    ctx->sem = golioth_sys_sem_create(1, 0);
+    if (!ctx->sem)
+    {
+        goto free_and_finish;
+    }
+
     ctx->is_last = false;
     ctx->path_prefix = path_prefix;
     ctx->path = path;
     ctx->content_type = content_type;
-    ctx->block_size = CONFIG_GOLIOTH_BLOCKWISE_UPLOAD_MAX_BLOCK_SIZE;
+    ctx->block_size = CONFIG_GOLIOTH_BLOCKWISE_DOWNLOAD_MAX_BLOCK_SIZE;
     ctx->block_idx = 0;
-    ctx->block_buffer = data_buf;
-    ctx->callback_arg = callback_arg;
-    ctx->callback.read_cb = cb;
+    ctx->callback_arg = NULL;
+    ctx->callback.read_cb = NULL; /* sets all union members to NULL */
     golioth_coap_next_token(ctx->token);
+
+    return ctx;
+
+free_and_finish:
+    blockwise_upload_free(ctx);
+
+finish:
+    return NULL;
 }
 
 // Blockwise upload's internal callback function that the COAP client calls
@@ -96,6 +160,22 @@ static void on_block_sent(struct golioth_client *client,
     ctx->negotiated_blocksize_szx = block_szx;
 
     golioth_sys_sem_give(ctx->sem);
+}
+
+// Blockwise multi-part upload's internal callback function that the COAP client calls
+static void on_multi_block_sent(struct golioth_client *client,
+                                enum golioth_status status,
+                                const struct golioth_coap_rsp_code *coap_rsp_code,
+                                const char *path,
+                                size_t block_szx,
+                                void *arg)
+{
+    struct blockwise_transfer *ctx = (struct blockwise_transfer *) arg;
+
+    if (ctx->callback.set_cb)
+    {
+        ctx->callback.set_cb(client, status, coap_rsp_code, path, ctx->callback_arg);
+    }
 }
 
 // Function to call the application's read block callback for obtaining
@@ -219,28 +299,19 @@ enum golioth_status golioth_blockwise_post(struct golioth_client *client,
         return status;
     }
 
-    struct blockwise_transfer *ctx = malloc(sizeof(struct blockwise_transfer));
+    struct blockwise_transfer *ctx =
+        blockwise_upload_init(path_prefix,
+                              path,
+                              content_type,
+                              CONFIG_GOLIOTH_BLOCKWISE_UPLOAD_MAX_BLOCK_SIZE,
+                              false);
     if (!ctx)
     {
-        status = GOLIOTH_ERR_MEM_ALLOC;
-        goto finish;
+        return GOLIOTH_ERR_MEM_ALLOC;
     }
 
-    uint8_t *data_buff = malloc(CONFIG_GOLIOTH_BLOCKWISE_UPLOAD_MAX_BLOCK_SIZE);
-    if (!data_buff)
-    {
-        status = GOLIOTH_ERR_MEM_ALLOC;
-        goto finish_with_ctx;
-    }
-
-    blockwise_upload_init(ctx, data_buff, path_prefix, path, content_type, read_cb, callback_arg);
-
-    ctx->sem = golioth_sys_sem_create(1, 0);
-    if (!ctx->sem)
-    {
-        status = GOLIOTH_ERR_MEM_ALLOC;
-        goto finish_with_buff;
-    }
+    ctx->callback.read_cb = read_cb;
+    ctx->callback_arg = callback_arg;
 
     while (!ctx->is_last)
     {
@@ -270,19 +341,66 @@ enum golioth_status golioth_blockwise_post(struct golioth_client *client,
     }
 
     /* Upload complete, clean up allocated resources */
+    blockwise_upload_free(ctx);
 
-    golioth_sys_sem_destroy(ctx->sem);
-
-finish_with_buff:
-    free(data_buff);
-
-finish_with_ctx:
-    free(ctx);
-
-finish:
     return status;
 }
 
+// Create an async upload context
+struct blockwise_transfer *golioth_blockwise_upload_start(const char *path_prefix,
+                                                          const char *path,
+                                                          enum golioth_content_type content_type,
+                                                          golioth_set_cb_fn cb,
+                                                          void *callback_arg)
+{
+    struct blockwise_transfer *ctx =
+        blockwise_upload_init(path_prefix, path, content_type, 0, true);
+    if (!ctx)
+    {
+        return NULL;
+    }
+
+    ctx->callback.set_cb = cb;
+    ctx->callback_arg = callback_arg;
+
+    return ctx;
+}
+
+// Destroy an async upload context
+void golioth_blockwise_upload_stop(struct blockwise_transfer *ctx)
+{
+    blockwise_upload_free(ctx);
+}
+
+// Send a single block asynchronously
+enum golioth_status golioth_blockwise_upload_block(struct golioth_client *client,
+                                                   struct blockwise_transfer *ctx,
+                                                   uint32_t block_idx,
+                                                   uint8_t *block_buffer,
+                                                   size_t data_len,
+                                                   bool is_last)
+{
+    if (!client || !ctx || !block_buffer)
+    {
+        return GOLIOTH_ERR_NULL;
+    }
+
+    return golioth_coap_client_set_block(
+        client,
+        ctx->token,
+        ctx->path_prefix,
+        ctx->stored_path,
+        is_last,
+        ctx->content_type,
+        block_idx,
+        BLOCKSIZE_TO_SZX(CONFIG_GOLIOTH_BLOCKWISE_DOWNLOAD_MAX_BLOCK_SIZE),
+        block_buffer,
+        data_len,
+        on_multi_block_sent,
+        ctx,
+        false,
+        GOLIOTH_SYS_WAIT_FOREVER);
+}
 
 /* Blockwise Downloads related functions */
 

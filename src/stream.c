@@ -73,5 +73,32 @@ enum golioth_status golioth_stream_set_blockwise_sync(struct golioth_client *cli
                                   arg);
 }
 
+struct blockwise_transfer *golioth_stream_blockwise_start(const char *path,
+                                                          enum golioth_content_type content_type,
+                                                          golioth_set_cb_fn cb,
+                                                          void *callback_arg)
+{
+    return golioth_blockwise_upload_start(GOLIOTH_STREAM_PATH_PREFIX,
+                                          path,
+                                          content_type,
+                                          cb,
+                                          callback_arg);
+}
+
+void golioth_stream_blockwise_stop(struct blockwise_transfer *ctx)
+{
+    return golioth_blockwise_upload_stop(ctx);
+}
+
+enum golioth_status golioth_stream_blockwise_set_block_async(struct golioth_client *client,
+                                                             struct blockwise_transfer *ctx,
+                                                             uint32_t block_idx,
+                                                             uint8_t *block_buffer,
+                                                             size_t data_len,
+                                                             bool is_last)
+{
+    return golioth_blockwise_upload_block(client, ctx, block_idx, block_buffer, data_len, is_last);
+}
+
 
 #endif  // CONFIG_GOLIOTH_STREAM
